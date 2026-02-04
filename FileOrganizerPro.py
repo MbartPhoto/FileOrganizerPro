@@ -54,14 +54,14 @@ from PyQt6.QtWidgets import (
     QRadioButton, QButtonGroup, QGroupBox, QMessageBox, QToolTip,
     QSizePolicy, QSpacerItem, QGridLayout
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QSettings
 from PyQt6.QtGui import QFont, QColor, QIcon, QPainter, QPixmap
 
 # =============================================================================
 # CONFIGURATION & CONSTANTS
 # =============================================================================
 
-VERSION = "2.6.4"
+VERSION = "2.7.0"
 
 class Colors:
     # Primary
@@ -185,6 +185,7 @@ class ClassificationSource(Enum):
     KEYWORDS = "keywords"
     CLIP = "clip"
     VISION = "vision"
+    LLM = "llm"
     RULE = "rule"
     HASH = "hash"
 
@@ -528,15 +529,18 @@ class FileClassifier(QThread):
     def run(self):
         try:
             trust_level = TrustLevel(self.options.get('trust_level', 'trust'))
+            use_llm = self.options.get('use_llm', False)
             self._detect_duplicates()
-            
+
+            unclassified: List[FileInfo] = []
             total = len(self.files)
+
             for i, file_info in enumerate(self.files):
                 if self._stop_requested:
                     break
-                
+
                 self.progress.emit(i + 1, total, file_info.name)
-                
+
                 if file_info.is_duplicate:
                     file_info.destination = "_Duplicates"
                     file_info.confidence = Confidence.HIGH
@@ -549,14 +553,28 @@ class FileClassifier(QThread):
                 elif file_info.is_photo and self.options.get('photo_mode', False):
                     self._classify_photo(file_info)
                 else:
+                    # Mark as fallback for now; LLM may reclassify
                     year = file_info.modified.strftime('%Y')
                     file_info.destination = f"Unsorted/{year}"
                     file_info.confidence = Confidence.LOW
                     file_info.source = ClassificationSource.RULE
                     file_info.reasoning = "No matching rule found"
-                
+                    if use_llm:
+                        unclassified.append(file_info)
+
                 self.file_classified.emit(file_info)
-            
+
+            # Send unclassified files to LLM in batches of 20
+            if use_llm and unclassified and not self._stop_requested:
+                batch_size = 20
+                for start in range(0, len(unclassified), batch_size):
+                    if self._stop_requested:
+                        break
+                    batch = unclassified[start:start + batch_size]
+                    self.progress.emit(start + len(batch), len(unclassified),
+                                       f"AI classifying batch {start // batch_size + 1}...")
+                    self._classify_batch_with_llm(batch)
+
             self.classification_complete.emit(self.files)
         except Exception as e:
             self.error.emit(str(e))
@@ -620,7 +638,7 @@ class FileClassifier(QThread):
     def _classify_photo(self, file_info: FileInfo):
         year = file_info.modified.strftime('%Y')
         name_lower = file_info.name.lower()
-        
+
         if any(x in name_lower for x in ['screenshot', 'screen shot', 'screen_shot']):
             file_info.destination = f"Photos/Screenshots/{year}"
             file_info.confidence = Confidence.HIGH
@@ -631,6 +649,171 @@ class FileClassifier(QThread):
             file_info.confidence = Confidence.LOW
             file_info.source = ClassificationSource.VISION
             file_info.reasoning = "Photo file - Vision AI would classify content"
+
+    def _classify_batch_with_llm(self, batch: List[FileInfo]):
+        import urllib.request
+        import urllib.error
+
+        llm_url = self.options.get('llm_url', 'http://localhost:1234').rstrip('/')
+        prompt_text = self.options.get('prompt', '')
+
+        file_list = []
+        for f in batch:
+            entry = {
+                'filename': f.name,
+                'extension': f.extension,
+                'size_bytes': f.size,
+                'modified': f.modified.strftime('%Y-%m-%d'),
+                'is_photo': f.is_photo,
+            }
+            if f.keywords:
+                entry['keywords'] = f.keywords
+            if f.description:
+                entry['description'] = f.description
+            file_list.append(entry)
+
+        system_prompt = (
+            "You are a file organization assistant. Given a list of files, classify each one "
+            "into an appropriate destination folder path. Return ONLY valid JSON — no markdown, "
+            "no code fences, no explanation.\n\n"
+            "Return a JSON array where each element has:\n"
+            '  {"filename": "...", "destination": "Category/Subcategory/YYYY", '
+            '"confidence": "high"|"medium"|"low", "reasoning": "brief reason"}\n\n'
+            "Rules:\n"
+            "- Use forward slashes for paths\n"
+            "- Include year (from file date) in paths where appropriate\n"
+            "- Group similar files together\n"
+            "- Use descriptive folder names\n"
+        )
+        if prompt_text:
+            system_prompt += f"\nUser's organization preferences:\n{prompt_text}\n"
+
+        user_msg = json.dumps(file_list, indent=2)
+
+        payload = json.dumps({
+            'model': 'qwen2-vl',
+            'messages': [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': f"Classify these {len(file_list)} files:\n{user_msg}"},
+            ],
+            'temperature': 0.3,
+            'max_tokens': 4096,
+        }).encode('utf-8')
+
+        try:
+            req = urllib.request.Request(
+                f"{llm_url}/v1/chat/completions",
+                data=payload,
+                headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
+                method='POST',
+            )
+            with urllib.request.urlopen(req, timeout=60) as response:
+                result = json.loads(response.read().decode('utf-8'))
+
+            content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+
+            # Strip markdown code fences if present
+            content = content.strip()
+            if content.startswith('```'):
+                first_newline = content.index('\n')
+                content = content[first_newline + 1:]
+            if content.endswith('```'):
+                content = content[:-3]
+            content = content.strip()
+
+            classifications = json.loads(content)
+            if not isinstance(classifications, list):
+                return
+
+            # Build lookup by filename
+            cls_map = {}
+            for c in classifications:
+                if isinstance(c, dict) and 'filename' in c and 'destination' in c:
+                    cls_map[c['filename']] = c
+
+            for f in batch:
+                c = cls_map.get(f.name)
+                if c:
+                    f.destination = c['destination']
+                    conf_str = c.get('confidence', 'medium').lower()
+                    f.confidence = {
+                        'high': Confidence.HIGH,
+                        'medium': Confidence.MEDIUM,
+                        'low': Confidence.LOW,
+                    }.get(conf_str, Confidence.MEDIUM)
+                    f.source = ClassificationSource.LLM
+                    f.reasoning = c.get('reasoning', 'Classified by AI')
+
+        except Exception:
+            pass  # Files keep their fallback classification
+
+
+# =============================================================================
+# FILE EXECUTOR
+# =============================================================================
+
+class FileExecutor(QThread):
+    progress = pyqtSignal(int, int, str)  # current, total, filename
+    file_done = pyqtSignal(str, bool, str)  # filename, success, error_msg
+    execution_complete = pyqtSignal(int, int, list)  # succeeded, failed, errors
+
+    def __init__(self, plan: 'OrganizationPlan'):
+        super().__init__()
+        self.plan = plan
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        target_root = Path(self.plan.target_root)
+        action = self.plan.action
+        total = len(self.plan.moves)
+        succeeded = 0
+        failed = 0
+        errors = []
+
+        # Create all destination folders
+        for folder in self.plan.folders:
+            folder_path = target_root / folder
+            folder_path.mkdir(parents=True, exist_ok=True)
+
+        for i, move in enumerate(self.plan.moves):
+            if self._stop_requested:
+                break
+
+            src = Path(move['source'])
+            dest = target_root / move['destination']
+            filename = move['filename']
+
+            self.progress.emit(i + 1, total, filename)
+
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+
+                # Handle filename conflicts
+                if dest.exists():
+                    stem = dest.stem
+                    suffix = dest.suffix
+                    counter = 1
+                    while dest.exists():
+                        dest = dest.parent / f"{stem}_{counter}{suffix}"
+                        counter += 1
+
+                if action == "move":
+                    shutil.move(str(src), str(dest))
+                else:
+                    shutil.copy2(str(src), str(dest))
+
+                succeeded += 1
+                self.file_done.emit(filename, True, "")
+            except Exception as e:
+                failed += 1
+                err_msg = str(e)
+                errors.append(f"{filename}: {err_msg}")
+                self.file_done.emit(filename, False, err_msg)
+
+        self.execution_complete.emit(succeeded, failed, errors)
 
 
 # =============================================================================
@@ -1263,17 +1446,26 @@ class FileOrganizerPro(QMainWindow):
         self.scanner: Optional[FileScanner] = None
         self.classifier: Optional[FileClassifier] = None
         self.scan_start_time: float = 0
-        self.settings = {
-            'llm_url': 'http://localhost:1234',
-            'max_files': 10000,
-            'threads': 8,
-            'thumb_size': 512,
-            'enable_logging': True,
-            'log_path': '~/fop_logs/'
-        }
-        
+        self.settings = self._load_settings()
+
         self._setup_ui()
         self._apply_styles()
+
+    def _load_settings(self) -> Dict[str, Any]:
+        s = QSettings("Bart Labs", "FileOrganizerPro")
+        return {
+            'llm_url': s.value('llm_url', 'http://localhost:1234', type=str),
+            'max_files': s.value('max_files', 10000, type=int),
+            'threads': s.value('threads', 8, type=int),
+            'thumb_size': s.value('thumb_size', 512, type=int),
+            'enable_logging': s.value('enable_logging', True, type=bool),
+            'log_path': s.value('log_path', '~/fop_logs/', type=str),
+        }
+
+    def _save_settings(self):
+        s = QSettings("Bart Labs", "FileOrganizerPro")
+        for key, value in self.settings.items():
+            s.setValue(key, value)
     
     def _setup_ui(self):
         self.setWindowTitle(f"FileOrganizerPro v{VERSION} — Bart Labs")
@@ -1909,7 +2101,7 @@ class FileOrganizerPro(QMainWindow):
         files_header.addStretch()
         
         self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["All Files", "High Confidence", "From Keywords", "From AI", "Duplicates"])
+        self.filter_combo.addItems(["All Files", "High Confidence", "From Keywords", "From AI", "From LLM", "Duplicates"])
         self.filter_combo.setStyleSheet(f"padding: 4px 8px; font-size: 11px;")
         self.filter_combo.currentTextChanged.connect(self._filter_files)
         files_header.addWidget(self.filter_combo)
@@ -2003,6 +2195,7 @@ class FileOrganizerPro(QMainWindow):
         dialog = PreferencesDialog(self, self.settings)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.settings = dialog.get_settings()
+            self._save_settings()
     
     def _browse_source(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Source Folder")
@@ -2149,6 +2342,8 @@ class FileOrganizerPro(QMainWindow):
             elif filter_text == "From Keywords" and f.source != ClassificationSource.KEYWORDS:
                 continue
             elif filter_text == "From AI" and f.source not in [ClassificationSource.CLIP, ClassificationSource.VISION]:
+                continue
+            elif filter_text == "From LLM" and f.source != ClassificationSource.LLM:
                 continue
             elif filter_text == "Duplicates" and not f.is_duplicate:
                 continue
@@ -2381,12 +2576,89 @@ class FileOrganizerPro(QMainWindow):
                             "4. Click Execute to organize with catalog linking"
                         )
                 else:
-                    # Direct execution
-                    QMessageBox.information(
-                        self, "Execute",
-                        f"Would {action} {len(self.files)} files.\n\n"
-                        "(Direct execution coming in next update)"
-                    )
+                    self._execute_plan(plan, action)
+
+
+    def _execute_plan(self, plan: OrganizationPlan, action: str):
+        confirm = QMessageBox.question(
+            self, f"Confirm {action.title()}",
+            f"This will {action} {len(plan.moves):,} files to:\n"
+            f"{plan.target_root}\n\n"
+            f"{'Files will be MOVED (originals removed).' if action == 'move' else 'Files will be COPIED (originals kept).'}\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        # Create progress dialog
+        self._exec_progress = QDialog(self)
+        self._exec_progress.setWindowTitle(f"{action.title()}ing Files...")
+        self._exec_progress.setFixedSize(500, 200)
+        self._exec_progress.setStyleSheet(f"background: white;")
+
+        layout = QVBoxLayout(self._exec_progress)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+
+        self._exec_status = QLabel(f"Starting {action}...")
+        self._exec_status.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {Colors.NAVY};")
+        layout.addWidget(self._exec_status)
+
+        self._exec_bar = QProgressBar()
+        self._exec_bar.setMaximum(len(plan.moves))
+        self._exec_bar.setStyleSheet(f"""
+            QProgressBar {{
+                border: 2px solid {Colors.NAVY};
+                border-radius: 8px;
+                text-align: center;
+                height: 28px;
+            }}
+            QProgressBar::chunk {{
+                background: {Colors.TEAL};
+                border-radius: 6px;
+            }}
+        """)
+        layout.addWidget(self._exec_bar)
+
+        self._exec_file_label = QLabel("")
+        self._exec_file_label.setStyleSheet(f"font-size: 11px; color: {Colors.SLATE};")
+        layout.addWidget(self._exec_file_label)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: white; border: 2px solid {Colors.NAVY};
+                border-radius: 6px; padding: 8px 20px; font-weight: bold;
+            }}
+        """)
+        cancel_btn.clicked.connect(lambda: self._executor.stop() if self._executor else None)
+        layout.addWidget(cancel_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+        self._executor = FileExecutor(plan)
+        self._executor.progress.connect(self._on_exec_progress)
+        self._executor.execution_complete.connect(self._on_exec_complete)
+        self._executor.start()
+
+        self._exec_progress.exec()
+
+    def _on_exec_progress(self, current: int, total: int, filename: str):
+        self._exec_bar.setValue(current)
+        self._exec_status.setText(f"Processing {current:,} / {total:,}")
+        self._exec_file_label.setText(filename)
+
+    def _on_exec_complete(self, succeeded: int, failed: int, errors: list):
+        self._exec_progress.accept()
+
+        msg = f"Completed: {succeeded:,} files processed successfully."
+        if failed:
+            msg += f"\n{failed:,} files failed."
+            if errors:
+                msg += "\n\nErrors:\n" + "\n".join(errors[:10])
+                if len(errors) > 10:
+                    msg += f"\n...and {len(errors) - 10} more"
+
+        QMessageBox.information(self, "Execution Complete", msg)
 
 
 def main():
