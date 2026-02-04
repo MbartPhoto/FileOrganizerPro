@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-FileOrganizerPro v2.6.3
+FileOrganizerPro v2.7.1
 By Bart Labs
 
 AI-powered file organization with Photo Mode, LrForge integration,
 and maximalist 2026 UI design.
+
+Changes in v2.7.1:
+- ADDED: DuckDB analytics logging (fop.classification_log, fop.organization_history)
+- ADDED: QSettings persistence (source/target paths, prompt, checkboxes survive restart)
+- FIXED: .fopplan bridge bug — added 'action' to plan.options for LrForge import
 
 Changes in v2.6.3:
 - FIXED: Preferences dialog layout - URL input now full width, visible
@@ -61,7 +66,7 @@ from PyQt6.QtGui import QFont, QColor, QIcon, QPainter, QPixmap
 # CONFIGURATION & CONSTANTS
 # =============================================================================
 
-VERSION = "2.7.0"
+VERSION = "2.7.1"
 
 class Colors:
     # Primary
@@ -383,6 +388,175 @@ class MetadataReader:
             pass
         
         return metadata
+
+
+# =============================================================================
+# DUCKDB ANALYTICS (Central Bart Labs database)
+# =============================================================================
+
+class DuckDBAnalytics:
+    """Logs FOP classification and execution results to the central DuckDB."""
+
+    DB_PATH = os.path.expanduser("~/Documents/BartLabs/bartlabs.duckdb")
+    DUCKDB_CLI = None
+
+    # Find DuckDB CLI
+    for _path in ["/opt/homebrew/bin/duckdb", "/usr/local/bin/duckdb", "/usr/bin/duckdb"]:
+        if os.path.exists(_path):
+            DUCKDB_CLI = _path
+            break
+
+    @classmethod
+    def available(cls) -> bool:
+        return cls.DUCKDB_CLI is not None
+
+    @classmethod
+    def _run_sql(cls, sql: str) -> bool:
+        if not cls.available():
+            return False
+        try:
+            os.makedirs(os.path.dirname(cls.DB_PATH), exist_ok=True)
+            result = subprocess.run(
+                [cls.DUCKDB_CLI, cls.DB_PATH, "-c", sql],
+                capture_output=True, text=True, timeout=30
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    @classmethod
+    def init_schema(cls) -> bool:
+        """Create fop schema and tables if they don't exist."""
+        if not cls.available():
+            return False
+        sql = """
+CREATE SCHEMA IF NOT EXISTS fop;
+
+CREATE TABLE IF NOT EXISTS fop.organization_history (
+    id INTEGER,
+    plan_id TEXT NOT NULL,
+    source_root TEXT NOT NULL,
+    target_root TEXT NOT NULL,
+    action TEXT NOT NULL,
+    total_files INTEGER,
+    total_size_bytes BIGINT,
+    files_classified_llm INTEGER,
+    files_classified_rule INTEGER,
+    files_classified_keyword INTEGER,
+    duplicates_found INTEGER,
+    executed_at TIMESTAMP DEFAULT now(),
+    execution_result TEXT
+);
+
+CREATE TABLE IF NOT EXISTS fop.classification_log (
+    id INTEGER,
+    plan_id TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    destination TEXT NOT NULL,
+    classification_source TEXT,
+    confidence TEXT,
+    reasoning TEXT,
+    is_duplicate BOOLEAN DEFAULT FALSE,
+    file_size_bytes BIGINT,
+    file_extension TEXT,
+    classified_at TIMESTAMP DEFAULT now()
+);
+
+CREATE SCHEMA IF NOT EXISTS shared;
+CREATE TABLE IF NOT EXISTS shared.product_activity (
+    id INTEGER,
+    product TEXT NOT NULL,
+    action TEXT NOT NULL,
+    details TEXT,
+    timestamp TIMESTAMP DEFAULT now()
+);
+"""
+        return cls._run_sql(sql)
+
+    @classmethod
+    def log_classification(cls, plan: 'OrganizationPlan', files: list):
+        """Log classification results after a classification run."""
+        if not cls.available():
+            return
+        cls.init_schema()
+
+        plan_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        source_root = plan.source_root or ""
+        target_root = plan.target_root or ""
+
+        # Count classification sources
+        llm_count = sum(1 for f in files if f.classification_source == "llm")
+        rule_count = sum(1 for f in files if f.classification_source == "rule")
+        keyword_count = sum(1 for f in files if f.classification_source == "keyword")
+        dupe_count = sum(1 for f in files if f.is_duplicate)
+        total_size = sum(f.size for f in files)
+
+        # Escape single quotes for SQL
+        def esc(val):
+            if val is None:
+                return "NULL"
+            return "'" + str(val).replace("'", "''") + "'"
+
+        statements = ["BEGIN TRANSACTION;"]
+
+        # Insert organization history
+        statements.append(
+            f"INSERT INTO fop.organization_history "
+            f"(plan_id, source_root, target_root, action, total_files, "
+            f"total_size_bytes, files_classified_llm, files_classified_rule, "
+            f"files_classified_keyword, duplicates_found, execution_result) "
+            f"VALUES ({esc(plan_id)}, {esc(source_root)}, {esc(target_root)}, "
+            f"{esc(plan.action)}, {len(files)}, {total_size}, "
+            f"{llm_count}, {rule_count}, {keyword_count}, {dupe_count}, 'classified');"
+        )
+
+        # Insert per-file classification log (batch of up to 500)
+        for f in files[:500]:
+            ext = os.path.splitext(f.name)[1].lower() if f.name else ""
+            statements.append(
+                f"INSERT INTO fop.classification_log "
+                f"(plan_id, filename, source_path, destination, "
+                f"classification_source, confidence, reasoning, "
+                f"is_duplicate, file_size_bytes, file_extension) "
+                f"VALUES ({esc(plan_id)}, {esc(f.name)}, {esc(str(f.path))}, "
+                f"{esc(f.destination)}, {esc(f.classification_source)}, "
+                f"{esc(f.confidence)}, {esc(f.reasoning)}, "
+                f"{f.is_duplicate}, {f.size}, {esc(ext)});"
+            )
+
+        # Log to shared activity
+        statements.append(
+            f"INSERT INTO shared.product_activity "
+            f"(product, action, details) VALUES ('fop', 'classification', "
+            f"'{json.dumps({\"files\": len(files), \"llm\": llm_count, \"rule\": rule_count}).replace(chr(39), chr(39)+chr(39))}');"
+        )
+
+        statements.append("COMMIT;")
+
+        # Run in background thread to avoid blocking UI
+        sql = "\n".join(statements)
+        threading.Thread(target=cls._run_sql, args=(sql,), daemon=True).start()
+
+    @classmethod
+    def log_execution(cls, plan: 'OrganizationPlan', succeeded: int, failed: int):
+        """Log execution results after files are moved/copied."""
+        if not cls.available():
+            return
+        cls.init_schema()
+
+        def esc(val):
+            if val is None:
+                return "NULL"
+            return "'" + str(val).replace("'", "''") + "'"
+
+        result = "success" if failed == 0 else ("partial" if succeeded > 0 else "failed")
+        sql = (
+            f"INSERT INTO shared.product_activity "
+            f"(product, action, details) VALUES ('fop', 'execution', "
+            f"'{json.dumps({\"action\": plan.action, \"succeeded\": succeeded, \"failed\": failed, \"result\": result}).replace(chr(39), chr(39)+chr(39))}');"
+        )
+        threading.Thread(target=cls._run_sql, args=(sql,), daemon=True).start()
 
 
 # =============================================================================
@@ -1460,13 +1634,71 @@ class FileOrganizerPro(QMainWindow):
             'thumb_size': s.value('thumb_size', 512, type=int),
             'enable_logging': s.value('enable_logging', True, type=bool),
             'log_path': s.value('log_path', '~/fop_logs/', type=str),
+            # Session state
+            'last_source': s.value('last_source', '', type=str),
+            'last_target': s.value('last_target', '', type=str),
+            'last_prompt': s.value('last_prompt', '', type=str),
+            'last_preset': s.value('last_preset', 0, type=int),
+            'include_subfolders': s.value('include_subfolders', True, type=bool),
+            'detect_duplicates': s.value('detect_duplicates', True, type=bool),
+            'photo_mode': s.value('photo_mode', True, type=bool),
+            'use_vision': s.value('use_vision', False, type=bool),
+            'trust_level': s.value('trust_level', 'trust', type=str),
         }
 
     def _save_settings(self):
         s = QSettings("Bart Labs", "FileOrganizerPro")
         for key, value in self.settings.items():
             s.setValue(key, value)
-    
+
+    def _save_session_state(self):
+        """Save current UI state so it persists across restarts."""
+        s = QSettings("Bart Labs", "FileOrganizerPro")
+        if hasattr(self, 'source_input'):
+            s.setValue('last_source', self.source_input.text())
+        if hasattr(self, 'target_input'):
+            s.setValue('last_target', self.target_input.text())
+        if hasattr(self, 'prompt_input'):
+            s.setValue('last_prompt', self.prompt_input.toPlainText())
+        if hasattr(self, 'include_subfolders'):
+            s.setValue('include_subfolders', self.include_subfolders.isChecked())
+        if hasattr(self, 'detect_duplicates'):
+            s.setValue('detect_duplicates', self.detect_duplicates.isChecked())
+        if hasattr(self, 'photo_mode'):
+            s.setValue('photo_mode', self.photo_mode.isChecked())
+        if hasattr(self, 'use_vision'):
+            s.setValue('use_vision', self.use_vision.isChecked())
+        if hasattr(self, 'trust_group'):
+            for btn in self.trust_group.buttons():
+                if btn.isChecked():
+                    s.setValue('trust_level', btn.property('trust_value'))
+                    break
+
+    def closeEvent(self, event):
+        """Save session state when the window is closed."""
+        self._save_session_state()
+        self._save_settings()
+        super().closeEvent(event)
+
+    def _restore_session_state(self):
+        """Restore UI state from saved settings."""
+        if self.settings.get('last_source'):
+            self.source_input.setText(self.settings['last_source'])
+        if self.settings.get('last_target'):
+            self.target_input.setText(self.settings['last_target'])
+        if self.settings.get('last_prompt'):
+            self.prompt_input.setText(self.settings['last_prompt'])
+        self.include_subfolders.setChecked(self.settings.get('include_subfolders', True))
+        self.detect_duplicates.setChecked(self.settings.get('detect_duplicates', True))
+        self.photo_mode.setChecked(self.settings.get('photo_mode', True))
+        self.use_vision.setChecked(self.settings.get('use_vision', False))
+        # Restore trust level
+        saved_trust = self.settings.get('trust_level', 'trust')
+        for btn in self.trust_group.buttons():
+            if btn.property('trust_value') == saved_trust:
+                btn.setChecked(True)
+                break
+
     def _setup_ui(self):
         self.setWindowTitle(f"FileOrganizerPro v{VERSION} — Bart Labs")
         self.setMinimumSize(1200, 800)
@@ -1484,7 +1716,8 @@ class FileOrganizerPro(QMainWindow):
         self._create_welcome_page()
         self._create_setup_page()
         self._create_results_page()
-        
+        self._restore_session_state()
+
         self.stack.setCurrentIndex(0)
     
     def _create_welcome_page(self):
@@ -2273,12 +2506,19 @@ class FileOrganizerPro(QMainWindow):
     def _on_classification_complete(self, files: List[FileInfo]):
         self.files = files
         elapsed = time.time() - self.scan_start_time
-        
+
         self.analyze_btn.setEnabled(True)
         self.analyze_btn.setText("📸 Analyze Files  →")
-        
+
         self._update_results(elapsed)
         self.stack.setCurrentIndex(2)
+
+        # Log classification to central DuckDB (async, non-blocking)
+        try:
+            plan = self._create_plan()
+            DuckDBAnalytics.log_classification(plan, files)
+        except Exception:
+            pass  # Analytics logging is best-effort
     
     def _on_error(self, error: str):
         self.analyze_btn.setEnabled(True)
@@ -2477,7 +2717,7 @@ class FileOrganizerPro(QMainWindow):
         plan.folders = list(set(f.destination for f in self.files if f.destination))
         
         for f in self.files:
-            plan.moves.append({
+            move_dict = {
                 'source': str(f.path),
                 'destination': f.destination + '/' + f.name if f.destination else f.name,
                 'filename': f.name,
@@ -2487,12 +2727,17 @@ class FileOrganizerPro(QMainWindow):
                 'reasoning': f.reasoning,
                 'is_duplicate': f.is_duplicate,
                 'duplicate_of': f.duplicate_of,
-            })
+            }
+            if f.file_hash:
+                move_dict['file_hash'] = f.file_hash
+            plan.moves.append(move_dict)
         
         plan.options = {
+            'action': action,
             'handle_duplicates': 'move_to_duplicates_folder',
             'create_folders': True,
             'on_conflict': 'rename',
+            'trust_level': self._get_trust_level(),
         }
         
         return plan
@@ -2635,6 +2880,7 @@ class FileOrganizerPro(QMainWindow):
         cancel_btn.clicked.connect(lambda: self._executor.stop() if self._executor else None)
         layout.addWidget(cancel_btn, alignment=Qt.AlignmentFlag.AlignRight)
 
+        self._exec_plan = plan  # Store for DuckDB logging on completion
         self._executor = FileExecutor(plan)
         self._executor.progress.connect(self._on_exec_progress)
         self._executor.execution_complete.connect(self._on_exec_complete)
@@ -2659,6 +2905,13 @@ class FileOrganizerPro(QMainWindow):
                     msg += f"\n...and {len(errors) - 10} more"
 
         QMessageBox.information(self, "Execution Complete", msg)
+
+        # Log execution to central DuckDB (async, non-blocking)
+        try:
+            if hasattr(self, '_exec_plan') and self._exec_plan:
+                DuckDBAnalytics.log_execution(self._exec_plan, succeeded, failed)
+        except Exception:
+            pass  # Analytics logging is best-effort
 
 
 def main():
